@@ -1,3 +1,7 @@
 title.akas.tsv.gz
 title.basics.tsv.gz
 title.ratings.tsv.gz
+
+/env/
+.~lock.*.csv#
+.~lock.*.tsv#
