@@ -1,10 +1,16 @@
 import pandas as pd
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
-from transformers import AutoTokenizer
-import torch
-from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import torch
+import os
+import multiprocessing
+
+# Set environment variables for performance
+os.environ["TOKENIZERS_PARALLELISM"] = "true"  # Enable parallel tokenization
+torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster matrix ops on Ampere GPUs
+torch.backends.cudnn.benchmark = True  # Optimize CuDNN for dynamic input shapes
 
 # Load your CSV
 df = pd.read_csv("data/cleaned_ds.csv")
@@ -47,14 +53,12 @@ df = df[df["label"] != -1]
 
 print(df["label"].value_counts())
 
-# df.to_csv("data/labeled_dataset.csv", index=False)
-
 # Split into train and test
 train_df, test_df = train_test_split(df, test_size=0.2, stratify=df["label"], random_state=42)
 
-# Convert to Hugging Face Dataset
-train_dataset = Dataset.from_pandas(train_df)
-test_dataset = Dataset.from_pandas(test_df)
+# Convert to Hugging Face Dataset and select only necessary columns
+train_dataset = Dataset.from_pandas(train_df[["plot", "label"]])
+test_dataset = Dataset.from_pandas(test_df[["plot", "label"]])
 
 model_name = "bert-base-uncased"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -64,13 +68,16 @@ def tokenize_function(examples):
         examples["plot"],
         padding="max_length",
         truncation=True,
-        max_length=256,
+        max_length=128,  # Reduced for faster processing
     )
 
+# Tokenize datasets without caching
 train_dataset = train_dataset.map(tokenize_function, batched=True)
 test_dataset = test_dataset.map(tokenize_function, batched=True)
 
-# Set format for PyTorch
+# Remove unnecessary columns and set format for PyTorch
+train_dataset = train_dataset.remove_columns(["plot"])  # Remove 'plot' after tokenization
+test_dataset = test_dataset.remove_columns(["plot"])
 train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 test_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
@@ -78,23 +85,38 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 if device == "cpu":
-    print("Warning: Training on CPU may be slow. Consider using a GPU if available.")
+    print("Warning: Training on CPU may be slow. GPU is recommended for optimal performance.")
 
 model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
+
+# Enable gradient checkpointing to save memory
+model.gradient_checkpointing_enable()
+
+# Compile model for faster execution (PyTorch 2.0+)
+if torch.__version__ >= "2.0":
+    model = torch.compile(model)
+
+num_workers = min(multiprocessing.cpu_count(), 14)
+print(f"Using {num_workers} CPU cores for data loading")
 
 training_args = TrainingArguments(
     output_dir="./result",
     eval_strategy="epoch",
     save_strategy="epoch",
     learning_rate=2e-5,
-    per_device_train_batch_size=16,
-    per_device_eval_batch_size=16,
+    per_device_train_batch_size=32,  # Increased for GPU utilization
+    per_device_eval_batch_size=32,
     num_train_epochs=4,
     weight_decay=0.01,
     load_best_model_at_end=True,
     metric_for_best_model="accuracy",
-    fp16=torch.cuda.is_available(),  # Use mixed precision if GPU available
-    dataloader_num_workers=14,  # Use all CPU cores for data loading
+    fp16=torch.cuda.is_available(),  # Mixed precision training
+    tf32=torch.cuda.is_available(),  # TensorFloat-32 for Ampere GPUs
+    gradient_accumulation_steps=2,  # Accumulate gradients for larger effective batch size
+    dataloader_num_workers=num_workers,
+    dataloader_pin_memory=True,  # Faster data transfer to GPU
+    dataloader_drop_last=False,  # Use all samples
+    torch_compile=torch.__version__ >= "2.0",  # Compile model if PyTorch 2.0+
 )
 
 def compute_metrics(eval_pred):
@@ -113,31 +135,12 @@ trainer = Trainer(
 )
 
 def predict_plot(plot_text):
-    inputs = tokenizer(plot_text, return_tensors="pt", padding=True, truncation=True, max_length=256)
+    inputs = tokenizer(plot_text, return_tensors="pt", padding=True, truncation=True, max_length=128)
     inputs = {k: v.to(device) for k, v in inputs.items()}
-    outputs = model(**inputs)
+    with torch.no_grad():  # Disable gradient computation for inference
+        outputs = model(**inputs)
     probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
     pred = torch.argmax(probs, dim=-1).item()
-    return "Major Stream" if pred == 0 else "Less Known Career"
-
-def load_model_and_predict(plot_text, model_path="./v1", device=None):
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(model_path).to(device)
-    model.eval()
-
-    inputs = tokenizer(
-        plot_text, return_tensors="pt", padding=True, truncation=True, max_length=256
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        outputs = model(**inputs)
-        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-        pred = torch.argmax(probs, dim=-1).item()
-
     return "Major Stream" if pred == 0 else "Less Known Career"
 
 if __name__ == '__main__':
@@ -145,13 +148,6 @@ if __name__ == '__main__':
     eval_results = trainer.evaluate()
     print(eval_results)
 
-    # Save model and tokenizer
-    model_save_path = "./v1"
-    tokenizer_save_path = "./v1"
-    model.save_pretrained(model_save_path)
-    tokenizer.save_pretrained(tokenizer_save_path)
-    print(f"Model and tokenizer saved to {model_save_path}")
-
-    # Example predictions using the loaded model function
-    print(load_model_and_predict("A young engineer struggles to build a startup."))
-    print(load_model_and_predict("A physicist discovers a new particle."))
+    # Example predictions
+    print(predict_plot("A young engineer struggles to build a startup."))
+    print(predict_plot("A physicist discovers a new particle."))
